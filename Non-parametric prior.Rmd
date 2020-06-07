@@ -1,0 +1,164 @@
+---
+title: "Non-parametric prior"
+output: html_document
+---
+
+
+```{r message=FALSE}
+library(dplyr)
+library(knitr)
+library(dirichletprocess)
+library(rstan)
+library(tidyr)
+```
+
+```{r}
+rats %>% 
+  sample_n(4) %>% 
+  kable
+```
+
+```{r}
+alpha0 <- 0.01
+beta0 <- 0.01
+
+alphaPosterior <- alpha0 + sum(rats$y) 
+betaPosterior <- beta0 + sum(rats$N) - sum(rats$y)
+
+thetaDraws <- rbeta(1000, alphaPosterior, betaPosterior)
+```
+
+
+
+```{r}
+stanModel <- stan_model("rats_hyper.stan")
+
+stanData <- list()
+stanData$y <- rats$y
+stanData$N <- rats$N
+stanData$n <- nrow(rats)
+
+smpls <- sampling(stanModel, stanData, chains = 4, iter = 5000, cores = 8)
+plot(smpls, par = c("alpha0", "beta0"))
+```
+
+```{r}
+wk <- c(0.5, 0.5)
+phik_alpha <- c(2, 5)
+phik_beta <- c(3, 10)
+
+xGrid <- seq(0, 1,by = 0.01)
+
+frameF <- data.frame(x = xGrid, 
+                     y1 = wk[1] * dbeta(xGrid, phik_alpha[1], phik_beta[1]),
+                     y2 = wk[2] * dbeta(xGrid, phik_alpha[2], phik_beta[2]),
+                     y3 = dbeta(xGrid, phik_alpha[1], phik_beta[1]), 
+                     y4 = dbeta(xGrid, phik_alpha[2], phik_beta[2]))
+
+ggplot(frameF) + 
+  geom_line(aes(x = x, y = y1, color = "y1")) + 
+  geom_line(aes(x = x, y = y2, color = "y2")) + 
+  # geom_line(aes(x = x, y = y3, color = "y3")) + 
+  # geom_line(aes(x = x, y = y4, color = "y4")) + 
+  geom_line(aes(x = x, y = y1 + y2))
+```
+
+
+```{r}
+FIT <- FALSE
+its <- 1500
+
+if(FIT){
+
+  print("Starting Fit")
+    
+  thetaDirichlet <- rbeta(nrow(rats), alphaPosterior, betaPosterior)
+  
+  dp <- DirichletProcessBeta(thetaDirichlet,
+                             1, 
+                             mhStep = c(0.002, 0.005),
+                             alphaPrior = c(2, 0.5))
+  
+  dp$numberClusters <- nrow(rats)
+  dp$clusterLabels <- seq_len(nrow(rats))
+  dp$clusterParameters <- PriorDraw(dp$mixingDistribution, nrow(rats))
+  dp$pointsPerCluster <- rep_len(1, nrow(rats))
+  
+  dp <- Fit(dp, 1)
+  
+  postFuncEval <- matrix(ncol=its, nrow=length(xGrid))
+  muPostVals <- matrix(ncol=its, nrow=nrow(rats))
+  nuPostVals <- matrix(ncol=its, nrow=nrow(rats))
+  
+  pb <- txtProgressBar(max=its, width=50, char="-", style=3)
+  
+  for(i in seq_len(its)){
+    
+    postClusters <- PosteriorClusters(dp)
+    
+    postFuncEval[,i] <- PosteriorFunction(dp)(xGrid)
+    
+    wk <- sample.int(length(postClusters$weights), 
+                     nrow(rats), 
+                     replace = T, 
+                     prob = postClusters$weights)
+    
+    muPost <- postClusters$params[[1]][,,wk]
+    nuPost <- postClusters$params[[2]][,,wk]
+    
+    aPost <- muPost * nuPost
+    bPost <- (1-muPost) * nuPost
+    
+    muPostVals[,i]  <- muPost
+    nuPostVals[,i]  <- nuPost
+    
+    newTheta <- rbeta(nrow(rats), aPost + rats$y, bPost + rats$N - rats$y)
+    
+    dp <- ChangeObservations(dp, newTheta)
+    dp <- Fit(dp, 100, updatePrior = T, progressBar = F)
+   
+    setTxtProgressBar(pb, i)
+    
+  }
+  
+  saveList <- list()
+  saveList$muPostVals <- muPostVals
+  saveList$nuPostVals <- nuPostVals
+  saveList$postFuncEval <- postFuncEval
+  
+  saveRDS(saveList, "dpPrior.RDS")
+} else {
+  print("Fit from Cache")  
+  saveList <- readRDS("dpPrior.RDS")
+  saveList$muPostVals -> muPostVals
+  saveList$nuPostVals -> nuPostVals
+  saveList$postFuncEval -> postFuncEval
+}
+
+```
+
+```{r}
+dirichletParamsMu <- data.frame(Value = c(muPostVals[,-(1:its/2)]))
+dirichletParamsMu$Parameter= "Mu"
+
+dirichletParamsNu <- data.frame(Value = c(nuPostVals[,-(1:its/2)]))
+dirichletParamsNu$Parameter="Nu"
+
+dirichletParams <- bind_rows(dirichletParamsMu, dirichletParamsNu)
+
+
+ggplot(dirichletParams, aes(x=Value)) + geom_density() + facet_wrap(~Parameter, scales="free")
+```
+
+```{r}
+ggplot(dirichletParams, aes(x=log(Value))) + geom_density() + facet_wrap(~Parameter, scales="free")
+
+```
+
+
+```{r}
+nclusters <- apply(muPostVals[, -(1:its/2)], 2, function(x) length(unique(x)))
+qplot(x=nclusters, geom="histogram", binwidth=1)
+```
+
+
